@@ -714,7 +714,7 @@ def _build_ruleset() -> dict:
     rs["passes"] = pass_rules
     rs["intercept_hosts"] += pass_hosts
     rs["intercept_all"] = bool(get_settings()["intercept_all"])
-    rs["ca_fingerprint"] = certs.fingerprint(certs.load_ca()[1])
+    rs["ca_fingerprint"] = certs.fingerprint(certs.load_ca_cert())
     rs["version"] = hashlib.sha256(json.dumps(rs, sort_keys=True).encode()).hexdigest()[:16]
     return rs
 

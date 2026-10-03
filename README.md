@@ -2,16 +2,16 @@
 
 URL / パス単位でアクセスを遮断する MITM プロキシと、その管理 API。
 
-- **プロキシ**: 公式 [mitmproxy](https://mitmproxy.org/) 12 (`mitmdump`) + 独自 addon (`proxy/shsw_blocker.py`)
+- **プロキシ**: [rama](https://github.com/plabayo/rama) 0.4 (Rust) で実装した MITM プロキシ (`proxy/`)
 - **管理 API**: FastAPI + SQLite (`api/`)
 - **管理 UI**: 別リポジトリ [shsw-frontend](../frontend)(トークンでこの API に接続)
 
 ```
                     ┌───────────────────── shsw-backend (docker compose) ────────────────────┐
- 端末 ── HTTP(S) ──▶│ proxy :8080  mitmdump + shsw_blocker.py                                │──▶ Internet
+ 端末 ── HTTP(S) ──▶│ proxy :8080  shsw-proxy (Rust / rama + BoringSSL)                      │──▶ Internet
  (プロキシ設定)     │     │ 2 秒ごとに /internal/sync (ルール取得・ブロックログ送信)         │
                     │     ▼                                                                   │
- shsw-frontend ────▶│ api   :8000  FastAPI ── SQLite (/data)  CA (/certs = mitmproxy confdir) │
+ shsw-frontend ────▶│ api   :8000  FastAPI ── SQLite (/data)  CA (/certs: ca.pem/ca-key.pem) │
  外部トリガー ─────▶│              Bearer トークン認証 / トリガーはトリガー毎のトークン       │
                     └─────────────────────────────────────────────────────────────────────────┘
 ```
@@ -23,11 +23,12 @@ URL / パス単位でアクセスを遮断する MITM プロキシと、その�
 - **API トリガー**: `POST /api/hooks/{id}` で有効化 / 停止 / トグル / スケジュールに戻す。継続時間 (N 分後に自動でスケジュールへ復帰) 指定可。
 - **手動上書き**: UI から即時に有効化・停止(期限付き/無期限)。
 - **タイムパス**: 普段はロック(遮断)し、API から **指定秒数だけ** 解除する独立機能(例: YouTube Shorts を 5 分だけ見る)。1 回の最大秒数・1 日の合計上限つき。解除期限はプロキシがリクエスト毎に判定するため秒単位で正確に失効する。
-- **証明書**: ルート CA の自動生成・再発行(プロキシ自動再起動)・配布 (pem / der / p12)、同じ CA で署名したサーバ証明書の発行。
+- **証明書**: ルート CA の自動生成・再発行(プロキシは再起動せずに切り替え)・配布 (pem / der / p12)、同じ CA で署名したサーバ証明書の発行。
 - **性能・安定性**:
-  - 遮断ポリシーに登録されたホスト **だけ** TLS を復号し、それ以外は TCP のまま素通し(`ignore_connection`)。CA 未導入の端末や証明書ピンニングのアプリも、対象外ホストなら影響を受けません。
+  - Rust (tokio + BoringSSL) 製で全 CPU コアを使う。遮断ポリシーやタイムパスに登録されたホスト **だけ** TLS を復号し、それ以外は復号せずにバイト列を中継(Rust 内で完結)。CA 未導入の端末や証明書ピンニングのアプリも、対象外ホストなら影響を受けません。
+  - 復号時は上流サーバの証明書を必ず検証(Mozilla のルート証明書)。端末には上流の証明書を写した証明書を shsw の CA で発行して返す。
   - ルール判定はプロキシ内のメモリ上で完結(API に問い合わせない)。API が停止しても最後のルール(ディスクにキャッシュ)で動作継続。
-  - `connection_strategy=lazy`、`stream_large_bodies=1m`、ログ抑制、`nofile` 65535、ヘルスチェック + `restart: unless-stopped`。
+  - リクエスト・レスポンスの本文はストリーミングで中継(バッファしない)、`nofile` 65535、ヘルスチェック + `restart: unless-stopped`。
 
 ## 必要環境
 
@@ -77,8 +78,9 @@ API 仕様は `http://<host>:8000/api/docs` (Swagger UI) で確認できます�
 | `SHSW_PUBLIC_URL` | 空 | 外部から見た API の URL (例 `http://192.168.1.10:8000`)。UI にトリガー URL・CA 配布 URL として表示 |
 | `API_BIND` / `API_PORT` | `0.0.0.0` / `8000` | 管理 API の公開アドレス / ポート |
 | `PROXY_BIND` / `PROXY_PORT` | `0.0.0.0` / `8080` | MITM プロキシの公開アドレス / ポート |
-| `PROXY_EXTRA_ARGS` | 空 | `mitmdump` への追加引数(例 `--set proxyauth=user:pass`) |
-| `PROXY_LOG_LEVEL` | `warn` | mitmproxy のログレベル(`info` で接続ごとのログを出す) |
+| `PROXY_AUTH` | 空 | `user:pass` を指定するとプロキシ認証 (Basic) を要求 |
+| `PROXY_ALLOW_PUBLIC_CLIENTS` | `false` | `true` でプライベート IP / Tailscale 以外のクライアントも受け付ける |
+| `PROXY_LOG_LEVEL` | `info` | プロキシのログレベル(`debug` で接続ごとの詳細、`info,rama=warn` のような指定も可) |
 | `TZ` | `Asia/Tokyo` | スケジュール判定に使うタイムゾーン |
 
 ## 端末側の設定
@@ -86,11 +88,10 @@ API 仕様は `http://<host>:8000/api/docs` (Swagger UI) で確認できます�
 1. 端末の HTTP / HTTPS プロキシを `<このホストの IP>:8080` に設定(OS 設定、PAC、ブラウザ設定など)。
 2. ルート CA をインストール:
    - `http://<host>:8000/api/public/ca.pem`(`.crt` = DER、`.p12` も可)を開く、または
-   - プロキシ経由で `http://mitm.it` を開く
    - OS ごとの手順は管理 UI の「証明書」ページに記載
 3. 遮断対象の URL を開くと 403 のブロックページが表示されます。
 
-> **補足**: mitmproxy は既定でプライベート IP 以外のクライアントを拒否します (`block_global`)。インターネットに公開する場合は必ず `PROXY_EXTRA_ARGS=--set proxyauth=user:pass` 等で認証を掛けてください。
+> **補足**: プロキシは既定でプライベート IP・ループバック・Tailscale (100.64.0.0/10, fd7a::/16 等の ULA) 以外のクライアントを拒否します(意図せずオープンプロキシになるのを防ぐため)。インターネットから使う場合は `PROXY_AUTH=user:pass` を設定したうえで `PROXY_ALLOW_PUBLIC_CLIENTS=true` にしてください。
 
 ## API トリガー
 
@@ -175,7 +176,7 @@ systemctl status shsw-backend.service
 
 - **ヘルスチェック**: api は `/api/health`、proxy は 8080 番ポートへの接続で監視。`docker compose ps` で `healthy` を確認。
 - **ログ**: json-file ドライバで 10MB × 5 世代にローテーション。`docker compose logs -f proxy api`。
-- **CA 再発行時**: API が CA を書き換えると、プロキシ addon が変更を検知して自ら終了し、restart ポリシーで再起動して新しい CA を読み込みます(数秒間通信断)。
+- **CA 再発行時**: API が CA を書き換えると、プロキシが同期時に変更を検知し、再起動せずに新しい CA での証明書発行へ切り替えます(数秒以内)。
 - **API 停止時**: プロキシは最後に取得したルールで動作を続けます(時間帯の切り替えは API 復帰後に反映)。
 - **バックアップ**: 名前付きボリューム `shsw_shsw-data` (DB) と `shsw_shsw-certs` (CA 秘密鍵) を保存してください。
 
@@ -196,14 +197,37 @@ systemctl status shsw-backend.service
 | ブロックログのクライアント IP が 172.x.x.x | Docker の NAT 経由のため。LAN の端末からのアクセスでは通常実 IP になります |
 | フロントエンドが 401 | `docker compose exec api shsw-token list` で有効なトークンか確認 |
 
+## 性能(Raspberry Pi 5 での実測)
+
+| 経路 | rama 版 | (参考) mitmproxy 12 |
+| --- | --- | --- |
+| 素通し (CONNECT トンネル, LAN 内 1GB) | 約 5.3 Gbps(4 並列 6.0 Gbps) | 約 1.9 Gbps(4 並列でも 1.9 Gbps = 1 コア上限) |
+| 平文 HTTP の判定つき中継 (LAN 内 1GB) | 約 5.8 Gbps | 約 2.1 Gbps |
+| HTTPS 復号 (欧州のサーバから 100MB, HTTP/2) | 約 90〜100 Mbps(= 回線速度) | 約 80〜100 Mbps |
+| 解除・ロック・トリガーの反映 | 0.05〜0.15 秒 | — |
+
+HTTP/2 で復号するときは、上流への受信ウィンドウ(既定 32MiB / 接続 64MiB)が遠いサーバからの速度を決めます。
+メモリを抑えたい場合は proxy コンテナの環境変数 `SHSW_H2_STREAM_WINDOW_MB` / `SHSW_H2_CONN_WINDOW_MB` で小さくできます(8/16 で約 60Mbps)。
+
 ## 開発
 
 ```bash
+# API
 cd api
 python -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
 SHSW_DB_PATH=./dev.db SHSW_CERT_DIR=./dev-certs SHSW_INTERNAL_TOKEN=dev uvicorn app.main:app --reload
 python -m app.cli create dev    # 開発用トークン (SHSW_DB_PATH を合わせる)
+
+# プロキシ (Rust 1.96 以上。BoringSSL のビルドに cmake / clang が必要)
+cd proxy
+cargo test --release
+cargo build --release
+SHSW_API_URL=http://localhost:8000 SHSW_INTERNAL_TOKEN=dev SHSW_CERT_DIR=../api/dev-certs \
+  SHSW_LISTEN=127.0.0.1:8080 ./target/release/shsw-proxy
+
+# ホストに Rust を入れずに試す場合
+docker compose build proxy
 ```
 
 ## ディレクトリ
@@ -215,6 +239,10 @@ api/app/certs.py     CA / サーバ証明書
 api/app/auth.py      トークン認証
 api/app/passes.py    タイムパス(解除・ロック・日次上限)
 api/app/cli.py       shsw-token CLI
-proxy/shsw_blocker.py  mitmproxy addon
+proxy/Cargo.toml       プロキシ (rama 0.4 / BoringSSL)
+proxy/src/main.rs      プロキシ本体 (CONNECT 受付、復号 or 素通しの振り分け、MITM の組み立て)
+proxy/src/rules.rs     ルール判定 (ホスト/パス、allow 優先、タイムパス)
+proxy/src/block.rs     ブロック判定ミドルウェアとブロックページ、送信元 IP 制限
+proxy/src/sync.rs      API とのロングポーリング同期、CA の再読み込み
 deploy/              systemd ユニット
 ```

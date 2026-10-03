@@ -24,40 +24,34 @@ services:
     logging: *default-logging
 
   proxy:
-    image: mitmproxy/mitmproxy:12.2.3
+    # rama (Rust) で実装した MITM プロキシ。proxy/ を参照
+    build: ./proxy
+    image: shsw-proxy:latest
     restart: unless-stopped
     depends_on:
       api:
         condition: service_healthy
-    # 先頭が mitmdump だとイメージの entrypoint が非特権ユーザーに降格して起動する
-    command: >-
-      mitmdump
-      --listen-host 0.0.0.0 --listen-port 8080
-      -s /addons/shsw_blocker.py
-      --set connection_strategy=lazy
-      --set stream_large_bodies=1m
-      --set flow_detail=0
-      --set termlog_verbosity=${PROXY_LOG_LEVEL:-warn}
-      ${PROXY_EXTRA_ARGS:-}
     environment:
       TZ: ${TZ:-Asia/Tokyo}
       SHSW_API_URL: http://api:8000
       SHSW_INTERNAL_TOKEN: ${SHSW_INTERNAL_TOKEN:?set SHSW_INTERNAL_TOKEN in .env}
+      SHSW_CERT_DIR: /certs
+      SHSW_LISTEN: 0.0.0.0:8080
+      # 例: user:pass を指定するとプロキシ認証 (Basic) を要求
+      SHSW_PROXY_AUTH: ${PROXY_AUTH:-}
+      # true にするとプライベート IP / Tailscale 以外のクライアントも受け付ける(認証必須で)
+      SHSW_ALLOW_PUBLIC_CLIENTS: ${PROXY_ALLOW_PUBLIC_CLIENTS:-false}
+      # ログレベル (error/warn/info/debug)。モジュール単位の指定も可 (例 info,rama=warn)
+      SHSW_LOG: ${PROXY_LOG_LEVEL:-info}
     ports:
       - "${PROXY_BIND:-0.0.0.0}:${PROXY_PORT:-8080}:8080"
     volumes:
-      - shsw-certs:/home/mitmproxy/.mitmproxy
-      - ./proxy:/addons:ro
+      - shsw-certs:/certs
     ulimits:
       nofile:
         soft: 65535
         hard: 65535
-    healthcheck:
-      test: ["CMD", "python3", "-c", "import socket; socket.create_connection(('127.0.0.1', 8080), 2)"]
-      interval: 15s
-      timeout: 3s
-      retries: 3
-      start_period: 10s
+    stop_grace_period: 15s
     logging: *default-logging
 
 volumes:

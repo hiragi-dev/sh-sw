@@ -1,4 +1,4 @@
-"""CA / サーバ証明書の発行。CA は mitmproxy の confdir 形式で書き出す。"""
+"""CA / サーバ証明書の発行。CA は SHSW_CERT_DIR に ca.pem / ca-key.pem として書き出し、プロキシと共有する。"""
 import ipaddress
 import os
 import re
@@ -10,8 +10,11 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives.serialization import pkcs12
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
-CONFDIR = os.environ.get("SHSW_CERT_DIR", "/certs")
-CA_FILE = os.path.join(CONFDIR, "mitmproxy-ca.pem")
+CERT_DIR = os.environ.get("SHSW_CERT_DIR", "/certs")
+CA_CERT_FILE = os.path.join(CERT_DIR, "ca.pem")
+CA_KEY_FILE = os.path.join(CERT_DIR, "ca-key.pem")
+# mitmproxy 版 (旧) が使っていた鍵+証明書の一体型ファイル
+LEGACY_CA_FILE = os.path.join(CERT_DIR, "mitmproxy-ca.pem")
 _CERT_RE = re.compile(rb"-----BEGIN CERTIFICATE-----.+?-----END CERTIFICATE-----", re.S)
 
 
@@ -56,45 +59,54 @@ def generate_ca(common_name: str, organization: str, days: int, key_size: int):
 
 
 def write_ca_store(key, cert) -> None:
-    """mitmproxy が読む mitmproxy-ca.pem (鍵+証明書) と、配布用ファイル群を書き出す。"""
-    os.makedirs(CONFDIR, exist_ok=True)
+    """プロキシが読む CA (ca.pem / ca-key.pem) を書き出す。
+    鍵を先に書き、最後に証明書を置き換える(プロキシは証明書の変化を検知して読み直す)。"""
+    os.makedirs(CERT_DIR, exist_ok=True)
     key_pem = key.private_bytes(
         serialization.Encoding.PEM,
         serialization.PrivateFormat.TraditionalOpenSSL,
         serialization.NoEncryption(),
     )
-    cert_pem = cert.public_bytes(serialization.Encoding.PEM)
-    # 配布用 (mitm.it のオンボーディングページもこれらを参照する)
-    _write_atomic(os.path.join(CONFDIR, "mitmproxy-ca-cert.pem"), cert_pem)
-    _write_atomic(os.path.join(CONFDIR, "mitmproxy-ca-cert.cer"), cert_pem)
-    _write_atomic(
-        os.path.join(CONFDIR, "mitmproxy-ca-cert.p12"),
-        pkcs12.serialize_key_and_certificates(b"shsw CA", None, cert, None, serialization.NoEncryption()),
-    )
-    _write_atomic(
-        os.path.join(CONFDIR, "mitmproxy-ca.p12"),
-        pkcs12.serialize_key_and_certificates(b"shsw CA", key, cert, None, serialization.NoEncryption()),
-        0o600,
-    )
-    # 最後に本体を置き換える(プロキシ側はこのファイルの変化で再起動する)
-    _write_atomic(CA_FILE, key_pem + cert_pem, 0o600)
+    _write_atomic(CA_KEY_FILE, key_pem, 0o600)
+    _write_atomic(CA_CERT_FILE, cert.public_bytes(serialization.Encoding.PEM))
+
+
+_cert_cache: tuple[tuple[int, int], object] | None = None
+
+
+def load_ca_cert():
+    """CA 証明書のみ読む(秘密鍵の読み込み・検証は重いので避ける)。ファイルの更新時刻でキャッシュ。"""
+    global _cert_cache
+    st = os.stat(CA_CERT_FILE)
+    key = (st.st_mtime_ns, st.st_size)
+    if _cert_cache is None or _cert_cache[0] != key:
+        with open(CA_CERT_FILE, "rb") as f:
+            _cert_cache = (key, x509.load_pem_x509_certificate(f.read()))
+    return _cert_cache[1]
 
 
 def load_ca():
-    with open(CA_FILE, "rb") as f:
-        data = f.read()
-    key = serialization.load_pem_private_key(data, password=None)
-    m = _CERT_RE.search(data)
-    if not m:
-        raise ValueError("CA certificate not found in mitmproxy-ca.pem")
-    cert = x509.load_pem_x509_certificate(m.group(0))
+    with open(CA_KEY_FILE, "rb") as f:
+        key = serialization.load_pem_private_key(f.read(), password=None)
+    with open(CA_CERT_FILE, "rb") as f:
+        cert = x509.load_pem_x509_certificate(f.read())
     return key, cert
 
 
 def ensure_ca() -> None:
-    if not os.path.exists(CA_FILE):
-        key, cert = generate_ca("shsw Proxy CA", "shsw", 3650, 2048)
-        write_ca_store(key, cert)
+    if os.path.exists(CA_CERT_FILE) and os.path.exists(CA_KEY_FILE):
+        return
+    if os.path.exists(LEGACY_CA_FILE):
+        # mitmproxy 版からの移行: 既存の CA をそのまま引き継ぐ(端末の入れ直しは不要)
+        with open(LEGACY_CA_FILE, "rb") as f:
+            data = f.read()
+        m = _CERT_RE.search(data)
+        if m:
+            key = serialization.load_pem_private_key(data, password=None)
+            write_ca_store(key, x509.load_pem_x509_certificate(m.group(0)))
+            return
+    key, cert = generate_ca("shsw Proxy CA", "shsw", 3650, 2048)
+    write_ca_store(key, cert)
 
 
 def fingerprint(cert) -> str:
@@ -102,7 +114,7 @@ def fingerprint(cert) -> str:
 
 
 def ca_info() -> dict:
-    _, cert = load_ca()
+    cert = load_ca_cert()
     def attr(oid):
         v = cert.subject.get_attributes_for_oid(oid)
         return v[0].value if v else ""
@@ -119,7 +131,7 @@ def ca_info() -> dict:
 
 
 def ca_cert_bytes(fmt: str) -> bytes:
-    _, cert = load_ca()
+    cert = load_ca_cert()
     if fmt == "der":
         return cert.public_bytes(serialization.Encoding.DER)
     if fmt == "p12":

@@ -7,7 +7,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY app ./app
 RUN printf '#!/bin/sh\nexec python -m app.cli "$@"\n' > /usr/local/bin/shsw-token && chmod +x /usr/local/bin/shsw-token
-# mitmproxy イメージ側はファイル所有者の UID で動くため、非 root(1000) で CA を書き出す
+# プロキシ (uid 1000) が CA 鍵を読めるよう、同じ uid で書き出す
 RUN useradd -u 1000 -M -s /usr/sbin/nologin app \
  && mkdir -p /data /certs && chown app:app /data /certs
 USER app
