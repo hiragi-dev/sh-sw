@@ -3,60 +3,48 @@
 //! - HTTP プロキシ (CONNECT) として待ち受け、CONNECT の宛先がルール対象のホストなら
 //!   TLS を中継・復号 (TlsMitmRelay) して HTTP リクエスト毎に判定する
 //! - ルール対象外のホストは復号せず、そのまま双方向に中継する (Rust 内で完結し高速)
+//! - SHSW_TRANSPARENT_LISTEN を指定すると透過プロキシの入口も開く。nftables の REDIRECT で
+//!   横取りした接続を、TLS の SNI で同じように振り分ける(ゲートウェイ構成用)
 //! - ルールは管理 API とロングポーリングで同期し、CA の差し替えもその場で反映する
 //!
 //! `shsw-proxy healthcheck` でコンテナのヘルスチェック用に待ち受けポートへ接続確認する。
 
 mod block;
 mod ca;
+mod relay;
 mod rules;
 mod state;
 mod sync;
 
 use crate::block::{BlockLayer, ClientFilterLayer};
-use crate::state::{Shared, Stats};
+use crate::relay::{HotSwap, OriginalDst, new_relay_svc, websocket_relay_layer};
+use crate::state::Shared;
 use arc_swap::ArcSwap;
 use rama::{
-    Layer, Service,
+    Layer,
     error::{BoxError, ErrorContext},
-    extensions::ExtensionsRef,
     http::{
         client::EasyHttpWebClient,
-        conn::H2ClientContextParams,
         layer::{
             map_response_body::MapResponseBodyLayer,
             remove_header::{RemoveRequestHeaderLayer, RemoveResponseHeaderLayer},
-            upgrade::{EagerHttpProxyConnector, UpgradeLayer, mitm::HttpUpgradeMitmRelayLayer},
+            upgrade::{EagerHttpProxyConnector, UpgradeLayer},
         },
         matcher::MethodMatcher,
-        proxy::mitm::{DefaultErrorResponse, HttpMitmRelay},
+        proxy::mitm::DefaultErrorResponse,
         server::HttpServer,
-        ws::handshake::{
-            matcher::{HttpWebSocketRelayServiceRequestMatcher, WebSocketMatcher},
-            mitm::{WebSocketRelayInput, WebSocketRelayOutput, WebSocketRelayService},
-        },
+        ws::handshake::matcher::WebSocketMatcher,
     },
-    io::{BridgeIo, Io},
-    layer::{ArcLayer, ConsumeErrLayer, HijackLayer, MapOutputLayer, TimeoutLayer},
-    net::{
-        client::ConnectorTarget, http::server::HttpPeekRouter, proxy::IoForwardService,
-    },
+    layer::{ArcLayer, ConsumeErrLayer, HijackLayer, TimeoutLayer},
     rt::Executor,
-    service::service_fn,
-    tcp::server::TcpListener,
+    tcp::{proxy::IoToProxyBridgeIoLayer, server::TcpListener},
     telemetry::tracing::{
         self,
         level_filters::LevelFilter,
         subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt},
     },
-    tls::{
-        KeyLogIntent,
-        boring::proxy::{TlsMitmEgressServerAuth, TlsMitmRelay},
-        client::ServerVerifyMode,
-        server::PeekTlsClientHelloService,
-    },
 };
-use std::{convert::Infallible, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).ok().filter(|v| !v.is_empty()).unwrap_or_else(|| default.to_owned())
@@ -124,13 +112,39 @@ async fn run(listen: SocketAddr) -> Result<(), BoxError> {
     let graceful = rama::graceful::Shutdown::default();
     let exec = Executor::graceful(graceful.guard());
 
-    let mitm = Arc::new(ArcSwap::from_pointee(new_mitm_svc(&exec, &ca, &shared)));
+    // 中継サービスは入口ごと (CONNECT / 透過) に型が異なるので 2 つ持ち、CA 変更時は両方作り直す
+    let connect_relay = Arc::new(ArcSwap::from_pointee(new_relay_svc(&exec, &ca, &shared)));
+    let transparent_relay = Arc::new(ArcSwap::from_pointee(new_relay_svc(&exec, &ca, &shared)));
     let reload_ca: sync::CaReloader = {
-        let (mitm, exec, shared) = (mitm.clone(), exec.clone(), shared.clone());
-        Arc::new(move |ca| mitm.store(Arc::new(new_mitm_svc(&exec, &ca, &shared))))
+        let (c, t, exec, shared) = (connect_relay.clone(), transparent_relay.clone(), exec.clone(), shared.clone());
+        Arc::new(move |ca| {
+            c.store(Arc::new(new_relay_svc(&exec, &ca, &shared)));
+            t.store(Arc::new(new_relay_svc(&exec, &ca, &shared)));
+        })
     };
 
     graceful.spawn_task(sync::run(shared.clone(), sync_cfg, reload_ca));
+
+    // 透過プロキシの入口 (ゲートウェイ構成)
+    let transparent_listen: Option<SocketAddr> = match env_or("SHSW_TRANSPARENT_LISTEN", "") {
+        v if v.is_empty() => None,
+        v => Some(v.parse().context("SHSW_TRANSPARENT_LISTEN")?),
+    };
+    if let Some(addr) = transparent_listen {
+        graceful.spawn_task_fn(async move |guard| {
+            let listener = TcpListener::build(Executor::graceful(guard))
+                .bind_address(addr)
+                .await
+                .expect("bind transparent listener");
+            tracing::info!(listen = %addr, "transparent proxy listening");
+            let svc = OriginalDst {
+                inner: IoToProxyBridgeIoLayer::extension_connector_target()
+                    .into_layer(HotSwap(transparent_relay)),
+                listen: addr,
+            };
+            listener.serve(svc).await;
+        });
+    }
 
     let proxy_auth = proxy_auth_config()?;
     let allow_public = env_or("SHSW_ALLOW_PUBLIC_CLIENTS", "false") == "true";
@@ -144,16 +158,11 @@ async fn run(listen: SocketAddr) -> Result<(), BoxError> {
             .expect("bind proxy listener");
         tracing::info!(%listen, "shsw proxy listening");
 
-        let relay = ShswConnectRelay {
-            shared: shared.clone(),
-            mitm,
-            forward: IoForwardService::new(exec.clone()),
-        };
         let connect = EagerHttpProxyConnector::new(
             TimeoutLayer::new(Duration::from_secs(30)).into_layer(rama::dns::client::DnsConnector::new(
                 rama::tcp::client::service::TcpConnector::new(),
             )),
-            relay,
+            HotSwap(connect_relay),
         );
 
         // 平文 HTTP (absolute-form) のリクエストはこのクライアントで中継する
@@ -206,126 +215,3 @@ fn proxy_auth_config() -> Result<Option<(String, String)>, BoxError> {
     Ok(Some((user.to_owned(), pass.to_owned())))
 }
 
-/// 上流 HTTP/2 の受信ウィンドウ (MiB)。SHSW_H2_STREAM_WINDOW_MB / SHSW_H2_CONN_WINDOW_MB で調整可
-fn h2_windows() -> (u32, u32) {
-    static W: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
-    *W.get_or_init(|| {
-        let mib = |key: &str, default: u32| {
-            env_or(key, "").parse::<u32>().unwrap_or(default).clamp(1, 1024) * 1024 * 1024
-        };
-        (mib("SHSW_H2_STREAM_WINDOW_MB", 32), mib("SHSW_H2_CONN_WINDOW_MB", 64))
-    })
-}
-
-/// CONNECT トンネルの振り分け: ルール対象のホストは MITM、それ以外は素通し
-#[derive(Clone)]
-struct ShswConnectRelay<M> {
-    shared: Arc<Shared>,
-    mitm: Arc<ArcSwap<M>>,
-    forward: IoForwardService,
-}
-
-impl<M, I, E> Service<BridgeIo<I, E>> for ShswConnectRelay<M>
-where
-    M: Service<BridgeIo<I, E>, Output = (), Error = Infallible>,
-    I: Io + Unpin + ExtensionsRef,
-    E: Io + Unpin + ExtensionsRef,
-{
-    type Output = ();
-    type Error = Infallible;
-
-    async fn serve(&self, bridge: BridgeIo<I, E>) -> Result<(), Infallible> {
-        let host = bridge
-            .0
-            .extensions()
-            .get_ref::<ConnectorTarget>()
-            .map(|t| t.0.host.to_string());
-        let rules = self.shared.rules.load();
-        let intercept = match &host {
-            Some(host) => rules.should_intercept(host),
-            None => rules.intercept_all,
-        };
-        drop(rules);
-
-        if intercept {
-            Stats::inc(&self.shared.stats.intercepted);
-            // 上流との HTTP/2 フロー制御ウィンドウを広げる。既定 (64KiB 程度) のままだと
-            // 遠いサーバ (RTT が大きい) からのダウンロードがウィンドウ/RTT で頭打ちになる。
-            // 実測: 8MiB/16MiB で約 60Mbps、32MiB/64MiB で直結と同等 (欧州のサーバ, Pi 5)。
-            let (stream_window, conn_window) = h2_windows();
-            bridge.1.extensions().insert(H2ClientContextParams {
-                init_stream_window_size: Some(stream_window),
-                init_connection_window_size: Some(conn_window),
-                ..Default::default()
-            });
-            let mitm = self.mitm.load_full();
-            mitm.serve(bridge).await
-        } else {
-            Stats::inc(&self.shared.stats.passthrough);
-            if let Err(err) = self.forward.serve(bridge).await {
-                tracing::debug!(?err, host, "passthrough relay ended with error");
-            }
-            Ok(())
-        }
-    }
-}
-
-fn new_mitm_svc<Ingress, Egress>(
-    exec: &Executor,
-    ca: &ca::LoadedCa,
-    shared: &Arc<Shared>,
-) -> impl Service<BridgeIo<Ingress, Egress>, Output = (), Error = Infallible> + Clone + use<Ingress, Egress>
-where
-    Ingress: Io + Unpin + ExtensionsRef,
-    Egress: Io + Unpin + ExtensionsRef,
-{
-    let http_mitm_relay = HttpMitmRelay::new(exec.clone()).with_http_middleware((
-        ConsumeErrLayer::trace_as_debug().with_response(DefaultErrorResponse::new()),
-        MapResponseBodyLayer::new_boxed_streaming_body(),
-        BlockLayer::new(shared.clone()),
-        websocket_relay_layer(exec.clone()),
-        ArcLayer::new(),
-    ));
-    // TLS 以外 (CONNECT で平文 HTTP) は HTTP として判定、それ以外のプロトコルは素通し
-    let maybe_http_relay = HttpPeekRouter::new(http_mitm_relay)
-        .with_known_non_http_protocol_methods()
-        .with_fallback(MapOutputLayer::new(drop).into_layer(IoForwardService::new(exec.clone())));
-
-    let tls_mitm_relay = TlsMitmRelay::new_cached_in_memory(ca.cert.clone(), ca.key.clone())
-        .with_keylog_intent(KeyLogIntent::Disabled)
-        // 上流サーバの証明書は必ず検証する(rama の既定は無検証)
-        .with_egress_server_auth(
-            TlsMitmEgressServerAuth::new()
-                .with_server_verify(ServerVerifyMode::Auto)
-                .with_webpki_roots(),
-        );
-
-    let app_mitm_relay =
-        PeekTlsClientHelloService::new(tls_mitm_relay.into_layer(maybe_http_relay.clone()))
-            .with_fallback(maybe_http_relay);
-
-    Arc::new(ConsumeErrLayer::trace_as_debug().into_layer(app_mitm_relay))
-}
-
-/// WebSocket は中身を変更せずに中継する
-fn websocket_relay_layer(
-    exec: Executor,
-) -> HttpUpgradeMitmRelayLayer<
-    HttpWebSocketRelayServiceRequestMatcher<
-        WebSocketRelayService<
-            impl Service<WebSocketRelayInput, Output = WebSocketRelayOutput, Error = Infallible> + Clone,
-        >,
-    >,
-> {
-    HttpUpgradeMitmRelayLayer::new(
-        exec,
-        HttpWebSocketRelayServiceRequestMatcher::new(WebSocketRelayService::new(service_fn(
-            async |input: WebSocketRelayInput| -> Result<WebSocketRelayOutput, Infallible> {
-                Ok(WebSocketRelayOutput {
-                    messages: vec![input.message],
-                    extensions: input.extensions,
-                })
-            },
-        ))),
-    )
-}

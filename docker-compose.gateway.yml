@@ -1,0 +1,39 @@
+# ゲートウェイ構成 (Raspberry Pi を上位ルーターと Wi-Fi AP の間に置く透過プロキシ) 用の追加設定。
+#
+#   .env に COMPOSE_FILE=docker-compose.yml:docker-compose.gateway.yml を書くか、
+#   docker compose -f docker-compose.yml -f docker-compose.gateway.yml up -d で起動する。
+#
+# - proxy をホストのネットワークで動かし、透過プロキシの入口 (GATEWAY_TRANSPARENT_PORT) を開く
+#   (REDIRECT 前の宛先 = SO_ORIGINAL_DST を取得するにはホストと同じ名前空間が必要)
+# - gateway コンテナが nftables / iptables のルールを張る(停止で取り除く)
+services:
+  proxy:
+    network_mode: host
+    ports: !reset []
+    environment:
+      SHSW_API_URL: http://127.0.0.1:${API_PORT:-8000}
+      SHSW_LISTEN: ${PROXY_BIND:-0.0.0.0}:${PROXY_PORT:-8080}
+      SHSW_TRANSPARENT_LISTEN: 0.0.0.0:${GATEWAY_TRANSPARENT_PORT:-8443}
+
+  gateway:
+    build: ./gateway
+    image: shsw-gateway:latest
+    restart: unless-stopped
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    depends_on:
+      proxy:
+        condition: service_healthy
+    environment:
+      GATEWAY_LAN_IFACES: ${GATEWAY_LAN_IFACES:?set GATEWAY_LAN_IFACES in .env (e.g. ap0 or eth1,ap0)}
+      GATEWAY_WAN_IFACE: ${GATEWAY_WAN_IFACE:-}
+      GATEWAY_TRANSPARENT_PORT: ${GATEWAY_TRANSPARENT_PORT:-8443}
+      GATEWAY_BLOCK_QUIC: ${GATEWAY_BLOCK_QUIC:-true}
+    stop_grace_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

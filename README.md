@@ -117,6 +117,43 @@ curl -X POST http://<host>:8000/api/hooks/1 \
 トークンは `X-Trigger-Token` ヘッダ / `Authorization: Bearer` / `?token=` クエリ / JSON の `token` のいずれかで渡せます(iOS ショートカットや IFTTT など、ヘッダを付けにくいクライアント向け)。
 反映はプロキシの同期間隔 (既定 2 秒) 以内です。
 
+## ゲートウェイ構成(透過プロキシ)
+
+Raspberry Pi を上位ルーターと Wi-Fi の間に置き、配下の端末は **プロキシ設定なし** で shsw を通るようにする構成です(端末に必要なのは CA のインストールだけ)。
+
+```
+上位ルーター ── eth0 ── Pi ──┬─ eth1 (USB LAN) ── Wi-Fi AP (AP/ブリッジモード) ── 端末
+                             └─ ap0  (Pi 自身の Wi-Fi AP, hostapd)            ── 端末
+```
+
+LAN 側にするインターフェースは `GATEWAY_LAN_IFACES` で選びます(`eth1` / `ap0` / `eth1,ap0`)。指定したインターフェースから来た通信だけに次を適用します。eth0・Tailscale・WireGuard など他の経路には影響しません。
+
+- グローバル宛ての TCP 80/443 を shsw-proxy の透過入口 (`GATEWAY_TRANSPARENT_PORT`, 既定 8443) へ REDIRECT。TLS の SNI で判定し、ルール対象のホストだけ復号
+- UDP 443 (QUIC) を拒否して TCP に落とさせる
+- LAN → WAN を NAT し、Docker が既定で拒否する転送を `DOCKER-USER` で許可
+- 透過入口への直接接続は拒否
+
+### 有効化
+
+`.env` に追記して起動し直します。
+
+```bash
+COMPOSE_FILE=docker-compose.yml:docker-compose.gateway.yml
+GATEWAY_LAN_IFACES=ap0          # Pi 自身の AP を使う場合
+# GATEWAY_WAN_IFACE=eth0        # 空なら既定経路から自動検出
+```
+
+```bash
+docker compose up -d --build
+docker compose logs gateway     # "applied: lan=[ap0] wan=eth0 ..." を確認
+sudo nft list table ip shsw_gw  # 張られたルールとカウンタ
+```
+
+- proxy はホストのネットワークで動きます(REDIRECT 前の宛先を取得するため)。通常プロキシ (8080) もそのまま併用でき、ログには端末の実 IP が記録されます。
+- gateway コンテナを止めると (`docker compose stop gateway` / `down`) ルールはすべて取り除かれます。
+- DHCP / DNS はホスト側で用意します。`ap0` は既存の hostapd + dnsmasq(配布するゲートウェイと DNS は Pi 自身)をそのまま使います。
+- 端末側の注意: iCloud プライベートリレーや端末独自の DoH を使うと判定が漏れることがあります。YouTube アプリ内の通信はパスで止められない場合があります。
+
 ## タイムパス
 
 UI の「タイムパス」で対象 URL(例: ホスト `youtube.com` + パス `/shorts`)と、既定秒数・1 回の最大秒数・1 日の合計上限を設定します。
@@ -240,7 +277,9 @@ api/app/auth.py      トークン認証
 api/app/passes.py    タイムパス(解除・ロック・日次上限)
 api/app/cli.py       shsw-token CLI
 proxy/Cargo.toml       プロキシ (rama 0.4 / BoringSSL)
-proxy/src/main.rs      プロキシ本体 (CONNECT 受付、復号 or 素通しの振り分け、MITM の組み立て)
+proxy/src/main.rs      プロキシ本体 (通常プロキシ / 透過プロキシの入口、同期、CA 差し替え)
+proxy/src/relay.rs     接続の振り分け (SNI で復号 or 素通し) と MITM の組み立て、透過入口
+gateway/gateway.sh     ゲートウェイ構成のルール (nftables REDIRECT / NAT / QUIC 遮断 / DOCKER-USER)
 proxy/src/rules.rs     ルール判定 (ホスト/パス、allow 優先、タイムパス)
 proxy/src/block.rs     ブロック判定ミドルウェアとブロックページ、送信元 IP 制限
 proxy/src/sync.rs      API とのロングポーリング同期、CA の再読み込み

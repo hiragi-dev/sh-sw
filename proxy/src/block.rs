@@ -89,17 +89,14 @@ where
 
         Stats::inc(&self.shared.stats.blocked);
         let is_pass = rule.kind == RuleKind::Pass;
-        let scheme = req
-            .uri()
-            .scheme_str()
-            .map(str::to_owned)
-            .unwrap_or_else(|| {
-                if req.extensions().get_ref::<ConnectorTarget>().is_some() {
-                    "https".to_owned()
-                } else {
-                    "http".to_owned()
-                }
-            });
+        // 平文 HTTP (absolute-form) は URI に scheme がある。CONNECT / 透過で横取りした接続は
+        // 宛先ポートで判断する (80 は平文、それ以外は TLS を終端したもの)
+        let scheme = req.uri().scheme_str().map(str::to_owned).unwrap_or_else(|| {
+            match req.extensions().get_ref::<ConnectorTarget>().map(|t| t.0.port) {
+                Some(80) | None => "http".to_owned(),
+                Some(_) => "https".to_owned(),
+            }
+        });
         let client = req
             .extensions()
             .get_ref::<SocketInfo>()
