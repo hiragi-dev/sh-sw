@@ -1,0 +1,65 @@
+name: shsw
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+services:
+  api:
+    build: ./api
+    image: shsw-api:latest
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ:-Asia/Tokyo}
+      SHSW_INTERNAL_TOKEN: ${SHSW_INTERNAL_TOKEN:?set SHSW_INTERNAL_TOKEN in .env}
+      SHSW_PUBLIC_URL: ${SHSW_PUBLIC_URL:-}
+    ports:
+      # 管理 API。フロントエンド・トリガー呼び出し元から到達できるアドレスで公開する
+      - "${API_BIND:-0.0.0.0}:${API_PORT:-8000}:8000"
+    volumes:
+      - shsw-data:/data
+      - shsw-certs:/certs
+    logging: *default-logging
+
+  proxy:
+    image: mitmproxy/mitmproxy:12.2.3
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    # 先頭が mitmdump だとイメージの entrypoint が非特権ユーザーに降格して起動する
+    command: >-
+      mitmdump
+      --listen-host 0.0.0.0 --listen-port 8080
+      -s /addons/shsw_blocker.py
+      --set connection_strategy=lazy
+      --set stream_large_bodies=1m
+      --set flow_detail=0
+      --set termlog_verbosity=${PROXY_LOG_LEVEL:-warn}
+      ${PROXY_EXTRA_ARGS:-}
+    environment:
+      TZ: ${TZ:-Asia/Tokyo}
+      SHSW_API_URL: http://api:8000
+      SHSW_INTERNAL_TOKEN: ${SHSW_INTERNAL_TOKEN:?set SHSW_INTERNAL_TOKEN in .env}
+    ports:
+      - "${PROXY_BIND:-0.0.0.0}:${PROXY_PORT:-8080}:8080"
+    volumes:
+      - shsw-certs:/home/mitmproxy/.mitmproxy
+      - ./proxy:/addons:ro
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import socket; socket.create_connection(('127.0.0.1', 8080), 2)"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    logging: *default-logging
+
+volumes:
+  shsw-data:
+  shsw-certs:
