@@ -81,8 +81,24 @@ where
         };
         let path = req.uri().request_target().into_owned();
 
+        let user_agent = req
+            .headers()
+            .get(header::USER_AGENT)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_owned();
+        // 調査用: SHSW_LOG に shsw::requests=debug を含めると、判定対象のリクエストを記録する
+        rama::telemetry::tracing::debug!(
+            target: "shsw::requests",
+            method = %req.method(),
+            host = %host,
+            path = %path.chars().take(200).collect::<String>(),
+            user_agent = %user_agent,
+            "request"
+        );
+
         let rules = self.shared.rules.load();
-        let Verdict::Block(rule) = rules.evaluate(&host, &path, now_epoch()) else {
+        let Verdict::Block(rule) = rules.evaluate(&host, &path, &user_agent, now_epoch()) else {
             drop(rules);
             return self.inner.serve(req).await;
         };

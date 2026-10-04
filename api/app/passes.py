@@ -168,6 +168,7 @@ def ruleset_entries() -> tuple[list[dict], list[dict]]:
                 "host": host,
                 "include_subdomains": sub,
                 "path": (pat.get("path") or "").strip(),
+                "user_agent": (pat.get("user_agent") or "").strip(),
                 "pass_id": row["id"],
                 "pass_name": row["name"],
                 "unlocked_until": until.timestamp() if until else 0,

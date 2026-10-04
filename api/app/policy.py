@@ -152,6 +152,7 @@ def build_ruleset() -> dict:
                 "host": pat["host"].strip().lower(),
                 "include_subdomains": bool(pat.get("include_subdomains", True)),
                 "path": (pat.get("path") or "").strip(),
+                "user_agent": (pat.get("user_agent") or "").strip(),
             }
             if p["action"] == "block":
                 intercept.append({"host": entry["host"], "include_subdomains": entry["include_subdomains"]})

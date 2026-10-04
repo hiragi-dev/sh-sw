@@ -29,6 +29,8 @@ pub struct PolicyRuleJson {
     pub include_subdomains: bool,
     #[serde(default)]
     pub path: String,
+    #[serde(default)]
+    pub user_agent: String,
     pub policy_id: i64,
     pub policy_name: String,
     pub action: String,
@@ -41,6 +43,8 @@ pub struct PassRuleJson {
     pub include_subdomains: bool,
     #[serde(default)]
     pub path: String,
+    #[serde(default)]
+    pub user_agent: String,
     pub pass_id: i64,
     pub pass_name: String,
     /// 解除期限 (UNIX epoch 秒)。0 ならロック中
@@ -86,6 +90,8 @@ pub struct Rule {
     path: String,
     /// `*` を含むパスは全体一致の glob、含まなければ前方一致
     path_re: Option<Regex>,
+    /// User-Agent の条件 (大文字小文字を区別しない)。`*` を含めば全体一致、含まなければ部分一致
+    ua_re: Option<Regex>,
     /// タイムパスの解除期限 (epoch 秒)
     pub unlocked_until: f64,
 }
@@ -98,12 +104,24 @@ impl Rule {
         host: &str,
         include_subdomains: bool,
         path: &str,
+        user_agent: &str,
         unlocked_until: f64,
     ) -> Self {
         let path = path.trim().to_owned();
         let path_re = path
             .contains('*')
             .then(|| Regex::new(&format!("(?s)^{}$", glob(&path))).ok())
+            .flatten();
+        let user_agent = user_agent.trim();
+        let ua_re = (!user_agent.is_empty())
+            .then(|| {
+                let body = if user_agent.contains('*') {
+                    format!("^{}$", glob(user_agent))
+                } else {
+                    regex::escape(user_agent)
+                };
+                Regex::new(&format!("(?is){body}")).ok()
+            })
             .flatten();
         Self {
             id,
@@ -112,12 +130,18 @@ impl Rule {
             host_re: host_regex(host, include_subdomains),
             path,
             path_re,
+            ua_re,
             unlocked_until,
         }
     }
 
-    pub fn matches(&self, host: &str, path: &str) -> bool {
+    pub fn matches(&self, host: &str, path: &str, user_agent: &str) -> bool {
         if !self.host_re.is_match(host) {
+            return false;
+        }
+        if let Some(re) = &self.ua_re
+            && !re.is_match(user_agent)
+        {
             return false;
         }
         if self.path.is_empty() {
@@ -163,6 +187,7 @@ impl RuleSet {
                 &r.host,
                 r.include_subdomains,
                 &r.path,
+                &r.user_agent,
                 0.0,
             );
             match kind {
@@ -181,6 +206,7 @@ impl RuleSet {
                     &p.host,
                     p.include_subdomains,
                     &p.path,
+                    &p.user_agent,
                     p.unlocked_until,
                 )
             })
@@ -223,18 +249,18 @@ impl RuleSet {
     }
 
     /// 優先順位: 有効な allow ポリシー → block ポリシー → ロック中のタイムパス
-    pub fn evaluate(&self, host: &str, path: &str, now_epoch: f64) -> Verdict<'_> {
+    pub fn evaluate(&self, host: &str, path: &str, user_agent: &str, now_epoch: f64) -> Verdict<'_> {
         let host = normalize_host(host);
-        if self.allow.iter().any(|r| r.matches(&host, path)) {
+        if self.allow.iter().any(|r| r.matches(&host, path, user_agent)) {
             return Verdict::Allow;
         }
-        if let Some(r) = self.block.iter().find(|r| r.matches(&host, path)) {
+        if let Some(r) = self.block.iter().find(|r| r.matches(&host, path, user_agent)) {
             return Verdict::Block(r);
         }
         if let Some(r) = self
             .passes
             .iter()
-            .find(|r| now_epoch >= r.unlocked_until && r.matches(&host, path))
+            .find(|r| now_epoch >= r.unlocked_until && r.matches(&host, path, user_agent))
         {
             return Verdict::Block(r);
         }
@@ -271,34 +297,53 @@ mod tests {
     #[test]
     fn host_and_subdomains() {
         let r = rs();
-        assert!(matches!(r.evaluate("example.com", "/", 0.0), Verdict::Block(_)));
-        assert!(matches!(r.evaluate("WWW.Example.com.", "/x", 0.0), Verdict::Block(_)));
-        assert!(matches!(r.evaluate("notexample.com", "/", 0.0), Verdict::Allow));
+        assert!(matches!(r.evaluate("example.com", "/", "", 0.0), Verdict::Block(_)));
+        assert!(matches!(r.evaluate("WWW.Example.com.", "/x", "", 0.0), Verdict::Block(_)));
+        assert!(matches!(r.evaluate("notexample.com", "/", "", 0.0), Verdict::Allow));
     }
 
     #[test]
     fn path_glob_and_prefix() {
         let r = rs();
-        assert!(matches!(r.evaluate("httpbin.org", "/status/200", 0.0), Verdict::Block(_)));
-        assert!(matches!(r.evaluate("httpbin.org", "/get", 0.0), Verdict::Allow));
-        assert!(matches!(r.evaluate("sub.httpbin.org", "/status/200", 0.0), Verdict::Allow));
+        assert!(matches!(r.evaluate("httpbin.org", "/status/200", "", 0.0), Verdict::Block(_)));
+        assert!(matches!(r.evaluate("httpbin.org", "/get", "", 0.0), Verdict::Allow));
+        assert!(matches!(r.evaluate("sub.httpbin.org", "/status/200", "", 0.0), Verdict::Allow));
     }
 
     #[test]
     fn allow_has_priority() {
         let r = rs();
-        assert!(matches!(r.evaluate("www.youtube.com", "/@lectures/videos", 0.0), Verdict::Allow));
-        assert!(matches!(r.evaluate("www.youtube.com", "/shorts/x", 0.0), Verdict::Block(_)));
+        assert!(matches!(r.evaluate("www.youtube.com", "/@lectures/videos", "", 0.0), Verdict::Allow));
+        assert!(matches!(r.evaluate("www.youtube.com", "/shorts/x", "", 0.0), Verdict::Block(_)));
     }
 
     #[test]
     fn time_pass_expiry() {
         let r = rs();
-        assert!(matches!(r.evaluate("www.tiktok.com", "/", 99.9), Verdict::Allow));
-        match r.evaluate("www.tiktok.com", "/", 100.0) {
+        assert!(matches!(r.evaluate("www.tiktok.com", "/", "", 99.9), Verdict::Allow));
+        match r.evaluate("www.tiktok.com", "/", "", 100.0) {
             Verdict::Block(rule) => assert_eq!(rule.kind, RuleKind::Pass),
             v => panic!("{v:?}"),
         }
+    }
+
+    #[test]
+    fn user_agent_condition() {
+        let json: RuleSetJson = serde_json::from_value(serde_json::json!({
+            "rules": [
+                {"host": "googlevideo.com", "path": "", "user_agent": "com.google.ios.youtube/*", "policy_id": 1, "policy_name": "yt app", "action": "block"},
+                {"host": "youtubei.googleapis.com", "path": "", "user_agent": "ios.youtube/", "policy_id": 2, "policy_name": "yt api", "action": "block"}
+            ]
+        }))
+        .unwrap();
+        let r = RuleSet::compile(&json);
+        let yt = "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_6 like Mac OS X;)";
+        let music = "com.google.ios.youtubemusic/8.10 (iPhone16,2; U; CPU iOS 18_6 like Mac OS X;)";
+        assert!(matches!(r.evaluate("rr1.googlevideo.com", "/videoplayback", yt, 0.0), Verdict::Block(_)));
+        assert!(matches!(r.evaluate("rr1.googlevideo.com", "/videoplayback", music, 0.0), Verdict::Allow));
+        assert!(matches!(r.evaluate("youtubei.googleapis.com", "/youtubei/v1/browse", yt, 0.0), Verdict::Block(_)));
+        assert!(matches!(r.evaluate("youtubei.googleapis.com", "/youtubei/v1/browse", music, 0.0), Verdict::Allow));
+        assert!(matches!(r.evaluate("youtubei.googleapis.com", "/", "", 0.0), Verdict::Allow));
     }
 
     #[test]

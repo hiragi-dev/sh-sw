@@ -91,6 +91,8 @@ class PatternIn(BaseModel):
     host: str
     include_subdomains: bool = True
     path: str = ""
+    # User-Agent の条件 (空 = 問わない)。'*' を含めば全体一致の glob、含まなければ部分一致。大文字小文字は区別しない
+    user_agent: str = Field(default="", max_length=500)
 
     @field_validator("host", mode="before")
     @classmethod
@@ -110,6 +112,11 @@ class PatternIn(BaseModel):
         if v and not v.startswith("/") and not v.startswith("*"):
             v = "/" + v
         return v
+
+    @field_validator("user_agent")
+    @classmethod
+    def _ua(cls, v: str) -> str:
+        return (v or "").strip()
 
 
 class WindowIn(BaseModel):
